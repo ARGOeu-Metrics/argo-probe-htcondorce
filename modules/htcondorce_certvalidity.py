@@ -8,9 +8,8 @@ import sys
 import OpenSSL
 import htcondor
 import pytz
+from argo_probe_htcondorce.probe_response import ProbeResponse
 from dateutil.parser import parse
-
-from probe_response import ProbeResponse
 
 
 class TimeoutException(Exception):
