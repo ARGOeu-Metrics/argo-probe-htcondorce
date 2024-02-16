@@ -28,4 +28,4 @@ class ProbeResponse:
         return self._code
 
     def msg(self):
-        return self.msg
+        return self._msg
