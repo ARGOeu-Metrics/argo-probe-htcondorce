@@ -3,7 +3,6 @@ import glob
 import sys
 
 NAME = 'argo-probe-htcondorce'
-NAGIOSPLUGINS = '/usr/libexec/argo/probes/htcondorce'
 
 
 def get_ver():
@@ -11,8 +10,8 @@ def get_ver():
         for line in open(NAME+'.spec'):
             if "Version:" in line:
                 return line.split()[1]
+
     except IOError:
-        print "Make sure that %s is in directory"  % (NAME+'.spec')
         sys.exit(1)
 
 
@@ -24,8 +23,8 @@ setup(name=NAME,
       description='Package includes probe for checking HTCondorCE certificate '
                   'validity',
       platforms='noarch',
-      url='http://argoeu.github.io/',
-      data_files=[(NAGIOSPLUGINS, glob.glob('src/*'))],
+      url="https://github.com/ARGOeu-Metrics/argo-probe-htcondorce",
+      data_files=[('/usr/libexec/argo/probes/htcondorce', glob.glob('src/*'))],
       packages=['argo_probe_htcondorce'],
       package_dir={'argo_probe_htcondorce': 'modules/'},
       )
