@@ -4,6 +4,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 
 import OpenSSL
 import htcondor
@@ -32,27 +33,45 @@ class timeout:
         signal.alarm(0)
 
 
-def validate_certificate(args):
-    status = ProbeResponse()
+class Certificate:
+    def __init__(self, args):
+        self.hostname = args.hostname
+        self.ca_bundle = args.ca_bundle
+        self.status = ProbeResponse()
+        self.pem_filename = f"/tmp/{self.hostname}.pem"
 
-    # Setting X509_USER_PROXY environmental variable
-    os.environ["X509_USER_PROXY"] = args.user_proxy
+        # Setting X509_USER_PROXY environmental variable
+        os.environ["X509_USER_PROXY"] = args.user_proxy
 
-    try:
-        ad = htcondor.Collector(f"{args.hostname}:9619").locate(
-            htcondor.DaemonTypes.Schedd, args.hostname
+    def _htcondor_fetch(self):
+        ad = htcondor.Collector(f"{self.hostname}:9619").locate(
+            htcondor.DaemonTypes.Schedd, self.hostname
         )
-        cert = htcondor.SecMan().ping(ad, "READ")["ServerPublicCert"]
-        x509 = OpenSSL.crypto.load_certificate(
-            OpenSSL.crypto.FILETYPE_PEM, cert
-        )
-        expiration_date = parse(x509.get_notAfter())
 
+        return htcondor.SecMan().ping(ad, "READ")["ServerPublicCert"]
+
+    def _fetch(self):
+        try:
+            cert = self._htcondor_fetch()
+
+            if not cert:
+                time.sleep(30)
+
+                cert = self._htcondor_fetch()
+
+            self._save(cert)
+
+            return cert
+
+        except htcondor.HTCondorException:
+            raise
+
+    def _is_cn_ok(self, x509):
         subject = x509.get_subject()
         cn = subject.CN
         pattern = re.compile(cn.replace('*', '[A-Za-z0-9_-]+?'))
         cn_ok = False
-        if bool(re.match(pattern, args.hostname)):
+        if bool(re.match(pattern, self.hostname)):
             cn_ok = True
 
         else:
@@ -68,26 +87,22 @@ def validate_certificate(args):
                     pattern = re.compile(
                         alt_name.replace('*', '[A-Za-z0-9_-]+?')
                     )
-                    if bool(re.match(pattern, args.hostname)):
+                    if bool(re.match(pattern, self.hostname)):
                         cn_ok = True
                         break
 
-        pem_filename = f"/tmp/{args.hostname}.pem"
-        with open(pem_filename, 'w') as f:
-            for line in cert:
-                f.write(line)
+        return cn_ok
 
+    def _is_ca_ok(self):
         cmd = [
-            'openssl', 'verify', '-verbose', '-CAfile', args.ca_bundle,
-            pem_filename
+            'openssl', 'verify', '-verbose', '-CAfile', self.ca_bundle,
+            self.pem_filename
         ]
         p = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
         p.communicate()[0].decode('utf-8').strip()
-        if os.path.isfile(pem_filename):
-            os.remove(pem_filename)
 
         if p.returncode == 0:
             ca_ok = True
@@ -95,44 +110,76 @@ def validate_certificate(args):
         else:
             ca_ok = False
 
-        if cn_ok and ca_ok:
-            if x509.has_expired():
-                status.critical(
-                    f"HTCondorCE certificate expired (was valid until "
-                    f"{expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')})!"
-                )
+        return ca_ok
 
-            else:
-                timedelta = expiration_date - datetime.datetime.now(tz=pytz.utc)
+    def _save(self, cert):
+        with open(self.pem_filename, 'w') as f:
+            for line in cert:
+                f.write(line)
 
-                if timedelta.days < 30:
-                    status.warning(
-                        f"HTCondorCE certificate will expire in "
-                        f"{timedelta.days} day(s) on "
-                        f"{expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')}!"
-                    )
+    def _clear(self):
+        if os.path.isfile(self.pem_filename):
+            os.remove(self.pem_filename)
 
-                else:
-                    status.ok(
-                        f"HTCondorCE certificate valid until "
-                        f"{expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')} "
-                        f"(expires in {timedelta.days} days)"
-                    )
+    def _check_expiration(self, x509):
+        expiration_date = parse(x509.get_notAfter())
+        if x509.has_expired():
+            self.status.critical(
+                f"HTCondorCE certificate expired (was valid until "
+                f"{expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')})!"
+            )
 
         else:
-            if not cn_ok:
-                status.critical(
-                    f'invalid CN ({args.hostname} does not match {cn})'
+            timedelta = expiration_date - datetime.datetime.now(tz=pytz.utc)
+
+            if timedelta.days < 30:
+                self.status.warning(
+                    f"HTCondorCE certificate will expire in "
+                    f"{timedelta.days} day(s) on "
+                    f"{expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')}!"
                 )
 
             else:
-                status.critical('invalid CA chain')
+                self.status.ok(
+                    f"HTCondorCE certificate valid until "
+                    f"{expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')} "
+                    f"(expires in {timedelta.days} days)"
+                )
 
-    except htcondor.HTCondorException as e:
-        status.unknown(f"Unable to fetch certificate: {str(e)}")
+    def validate(self):
+        try:
+            cert = self._fetch()
 
-    except Exception as e:
-        status.unknown(str(e))
+            if cert:
+                x509 = OpenSSL.crypto.load_certificate(
+                    OpenSSL.crypto.FILETYPE_PEM, cert
+                )
 
-    print(status.msg())
-    sys.exit(status.code())
+                subject = x509.get_subject()
+                cn = subject.CN
+
+                cn_ok = self._is_cn_ok(x509)
+
+                ca_ok = self._is_ca_ok()
+
+                if cn_ok and ca_ok:
+                    self._check_expiration(x509)
+
+                else:
+                    if not cn_ok:
+                        self.status.critical(
+                            f'invalid CN ({self.hostname} does not match {cn})'
+                        )
+
+                    else:
+                        self.status.critical('invalid CA chain')
+
+        except htcondor.HTCondorException as e:
+            self.status.unknown(f"Unable to fetch certificate: {str(e)}")
+
+        except Exception as e:
+            self.status.unknown(str(e))
+
+        self._clear()
+        print(self.status.msg())
+        sys.exit(self.status.code())

@@ -11,10 +11,20 @@ Group: Network/Monitoring
 BuildArch: noarch
 
 BuildRequires: python3-devel
+
+%if 0%{?el7}
 Requires: python36-requests
 Requires: python36-pyOpenSSL
 Requires: python36-pytz
 Requires: python36-dateutil
+
+%else
+Requires: python3-requests
+Requires: python3-pyOpenSSL
+Requires: python3-pytz
+Requires: python3-dateutil
+
+%endif
 
 
 %description
