@@ -2,7 +2,7 @@
 
 Name: argo-probe-htcondorce
 Summary: ARGO probe checking HTCondorCE certificate validity.
-Version: 0.1.0
+Version: 0.2.0
 Release: 1%{?dist}
 License: ASL 2.0
 Source0: %{name}-%{version}.tar.gz
@@ -54,5 +54,8 @@ rm -rf $RPM_BUILD_ROOT
 
 
 %changelog
+* Thu Apr 4 2024 Katarina Zailac <kzailac@srce.hr> - 0.2.0-1%{?dist}
+- ARGO-4496 HTCondorCE certificate validity probe raising weird CRITICAL error on Sensu
+- ARGO-4481 Rewrite htcondorce certificate validity probe to use Py3
 * Fri Jun 10 2022 Katarina Zailac <kzailac@gmail.com> - 0.1.0-1%{?dist}
 - AO-650 Harmonize argo-mon probes
