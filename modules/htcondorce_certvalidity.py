@@ -1,22 +1,19 @@
-import argparse
 import datetime
 import os
 import re
 import signal
 import subprocess
 import sys
+import time
 
 import OpenSSL
 import htcondor
 import pytz
+from argo_probe_htcondorce.probe_response import ProbeResponse
 from dateutil.parser import parse
 
-from NagiosResponse import NagiosResponse
 
-nagios = NagiosResponse()
-
-
-class TimeoutError(Exception):
+class TimeoutException(Exception):
     pass
 
 
@@ -26,7 +23,7 @@ class timeout:
         self.error_message = error_message
 
     def handle_timeout(self, signum, frame):
-        raise TimeoutError(self.error_message)
+        raise TimeoutException(self.error_message)
 
     def __enter__(self):
         signal.signal(signal.SIGALRM, self.handle_timeout)
@@ -36,25 +33,45 @@ class timeout:
         signal.alarm(0)
 
 
-def validate_certificate(args):
-    # Setting X509_USER_PROXY environmental variable
-    os.environ["X509_USER_PROXY"] = args.user_proxy
+class Certificate:
+    def __init__(self, args):
+        self.hostname = args.hostname
+        self.ca_bundle = args.ca_bundle
+        self.status = ProbeResponse()
+        self.pem_filename = f"/tmp/{self.hostname}.pem"
 
-    try:
-        ad = htcondor.Collector("%s:9619" % args.hostname).locate(
-            htcondor.DaemonTypes.Schedd, args.hostname
-        )
-        cert = htcondor.SecMan().ping(ad, "READ")["ServerPublicCert"]
-        x509 = OpenSSL.crypto.load_certificate(
-            OpenSSL.crypto.FILETYPE_PEM, cert
-        )
-        expiration_date = parse(x509.get_notAfter())
+        # Setting X509_USER_PROXY environmental variable
+        os.environ["X509_USER_PROXY"] = args.user_proxy
 
+    def _htcondor_fetch(self):
+        ad = htcondor.Collector(f"{self.hostname}:9619").locate(
+            htcondor.DaemonTypes.Schedd, self.hostname
+        )
+
+        return htcondor.SecMan().ping(ad, "READ")["ServerPublicCert"]
+
+    def _fetch(self):
+        try:
+            cert = self._htcondor_fetch()
+
+            if not cert:
+                time.sleep(30)
+
+                cert = self._htcondor_fetch()
+
+            self._save(cert)
+
+            return cert
+
+        except htcondor.HTCondorException:
+            raise
+
+    def _is_cn_ok(self, x509):
         subject = x509.get_subject()
         cn = subject.CN
         pattern = re.compile(cn.replace('*', '[A-Za-z0-9_-]+?'))
         cn_ok = False
-        if bool(re.match(pattern, args.hostname)):
+        if bool(re.match(pattern, self.hostname)):
             cn_ok = True
 
         else:
@@ -70,26 +87,22 @@ def validate_certificate(args):
                     pattern = re.compile(
                         alt_name.replace('*', '[A-Za-z0-9_-]+?')
                     )
-                    if bool(re.match(pattern, args.hostname)):
+                    if bool(re.match(pattern, self.hostname)):
                         cn_ok = True
                         break
 
-        pem_filename = '/tmp/%s.pem' % args.hostname
-        with open(pem_filename, 'w') as f:
-            for line in cert:
-                f.write(line)
+        return cn_ok
 
+    def _is_ca_ok(self):
         cmd = [
-            'openssl', 'verify', '-verbose', '-CAfile', args.ca_bundle,
-            pem_filename
+            'openssl', 'verify', '-verbose', '-CAfile', self.ca_bundle,
+            self.pem_filename
         ]
         p = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
         p.communicate()[0].decode('utf-8').strip()
-        if os.path.isfile(pem_filename):
-            os.remove(pem_filename)
 
         if p.returncode == 0:
             ca_ok = True
@@ -97,84 +110,76 @@ def validate_certificate(args):
         else:
             ca_ok = False
 
-        if cn_ok and ca_ok:
-            if x509.has_expired():
-                nagios.writeCriticalMessage(
-                    "HTCondorCE certificate expired (was valid until %s)!" %
-                    expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')
-                )
-                nagios.setCode(nagios.CRITICAL)
+        return ca_ok
 
-            else:
-                timedelta = expiration_date - datetime.datetime.now(tz=pytz.utc)
+    def _save(self, cert):
+        with open(self.pem_filename, 'w') as f:
+            for line in cert:
+                f.write(line)
 
-                if timedelta.days < 30:
-                    nagios.writeWarningMessage(
-                        "HTCondorCE certificate will expire in "
-                        "%d day(s) on %s!" % (
-                            timedelta.days,
-                            expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')
-                        )
-                    )
-                    nagios.setCode(nagios.WARNING)
+    def _clear(self):
+        if os.path.isfile(self.pem_filename):
+            os.remove(self.pem_filename)
 
-                else:
-                    nagios.writeOkMessage(
-                        "HTCondorCE certificate valid until %s "
-                        "(expires in %d days)" % (
-                            expiration_date.strftime('%b %-d %H:%M:%S %Y %Z'),
-                            timedelta.days
-                        )
-                    )
-                    nagios.setCode(nagios.OK)
+    def _check_expiration(self, x509):
+        expiration_date = parse(x509.get_notAfter())
+        if x509.has_expired():
+            self.status.critical(
+                f"HTCondorCE certificate expired (was valid until "
+                f"{expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')})!"
+            )
 
         else:
-            if not cn_ok:
-                nagios.writeCriticalMessage(
-                    'invalid CN (%s does not match %s)' % (args.hostname, cn)
+            timedelta = expiration_date - datetime.datetime.now(tz=pytz.utc)
+
+            if timedelta.days < 30:
+                self.status.warning(
+                    f"HTCondorCE certificate will expire in "
+                    f"{timedelta.days} day(s) on "
+                    f"{expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')}!"
                 )
 
             else:
-                nagios.writeCriticalMessage('invalid CA chain')
-            nagios.setCode(nagios.CRITICAL)
+                self.status.ok(
+                    f"HTCondorCE certificate valid until "
+                    f"{expiration_date.strftime('%b %-d %H:%M:%S %Y %Z')} "
+                    f"(expires in {timedelta.days} days)"
+                )
 
-        print nagios.getMsg()
+    def validate(self):
+        try:
+            cert = self._fetch()
 
-    except htcondor.HTCondorException as e:
-        print "UNKNOWN - Unable to fetch certificate: %s" % str(e)
-        nagios.setCode(nagios.UNKNOWN)
+            if cert:
+                x509 = OpenSSL.crypto.load_certificate(
+                    OpenSSL.crypto.FILETYPE_PEM, cert
+                )
 
-    except Exception as e:
-        print 'UNKNOWN - %s' % str(e)
-        nagios.setCode(nagios.UNKNOWN)
+                subject = x509.get_subject()
+                cn = subject.CN
 
-    sys.exit(nagios.getCode())
+                cn_ok = self._is_cn_ok(x509)
 
+                ca_ok = self._is_ca_ok()
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Nagios probe for checking HTCondorCE certificate validity"
-    )
-    parser.add_argument(
-        "--user_proxy", dest="user_proxy", type=str, required=True,
-        help="path to X509 user proxy"
-    )
-    parser.add_argument(
-        "-H", "--hostname", dest="hostname", type=str, required=True,
-        help="hostname"
-    )
-    parser.add_argument(
-        "-t", "--timeout", dest="timeout", type=int, default=60, help="timeout"
-    )
-    parser.add_argument(
-        "--ca-bundle", dest="ca_bundle", type=str, required=True,
-        help="location of CA bundle"
-    )
-    args = parser.parse_args()
+                if cn_ok and ca_ok:
+                    self._check_expiration(x509)
 
-    with timeout(seconds=args.timeout):
-        validate_certificate(args)
+                else:
+                    if not cn_ok:
+                        self.status.critical(
+                            f'invalid CN ({self.hostname} does not match {cn})'
+                        )
 
+                    else:
+                        self.status.critical('invalid CA chain')
 
-if __name__ == "__main__":
-    main()
+        except htcondor.HTCondorException as e:
+            self.status.unknown(f"Unable to fetch certificate: {str(e)}")
+
+        except Exception as e:
+            self.status.unknown(str(e))
+
+        self._clear()
+        print(self.status.msg())
+        sys.exit(self.status.code())
